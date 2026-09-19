@@ -1,0 +1,19 @@
+{
+  "name": "findyourmatch",
+  "version": "1.0.0",
+  "description": "Dating site with real-time chat",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.22.3",
+    "express-session": "^1.19.0",
+    "multer": "^1.4.5-lts.1",
+    "socket.io": "^4.8.3"
+  }
+}
