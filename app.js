@@ -335,6 +335,22 @@ const globalSoundScript = `
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (d) { if (d && typeof d.soundEnabled === 'boolean') window.fymSoundEnabled = d.soundEnabled; })
     .catch(function () {});
+  // Site-wide incoming-message sound: poll the unread total on every page and play
+  // when it increases. Skipped on chat pages, which already play a real-time sound
+  // for the open conversation (avoids double-firing).
+  if (window.location.pathname.indexOf('/chat/') !== 0) {
+    var lastUnread = null;
+    setInterval(function () {
+      fetch('/api/messages/unread-count-total')
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d || typeof d.count !== 'number') return;
+          if (lastUnread !== null && d.count > lastUnread) window.fymPlayMessageSound();
+          lastUnread = d.count;
+        })
+        .catch(function () {});
+    }, 10000);
+  }
 })();
 </script>`;
 
@@ -349,7 +365,7 @@ app.use((req, res, next) => {
             if (!html.includes('link rel="manifest"')) {
                 html = html.replace('</head>', '    <link rel="manifest" href="/manifest.json">\n    <link rel="apple-touch-icon" href="/icon-192.png">\n</head>');
             }
-            if (!html.includes('fymPlayMessageSound')) {
+            if (!html.includes('fymSoundInit')) {
                 html = html.replace('</body>', globalSoundScript + '\n</body>');
             }
             if (!html.includes('serviceWorker.register')) {
@@ -2795,18 +2811,13 @@ app.get('/dashboard', requireAuth, (req, res) => {
     ${getFooter()}
     ${renderBottomNav(user, 'messages')}
     <script>
-        let lastUnreadTotal = null;
         function updateMessageBadge() {
             fetch('/api/messages/unread-count-total')
                 .then(res => res.ok ? res.json() : { count: 0 })
                 .then(data => {
-                    const count = data.count || 0;
-                    if (lastUnreadTotal !== null && count > lastUnreadTotal && window.fymPlayMessageSound) {
-                        window.fymPlayMessageSound();
-                    }
-                    lastUnreadTotal = count;
                     const badges = document.querySelectorAll('.message-badge');
                     badges.forEach(badge => {
+                        const count = data.count || 0;
                         badge.textContent = count > 99 ? '99+' : count;
                         badge.style.display = count > 0 ? 'flex' : 'none';
                     });
