@@ -301,6 +301,43 @@ app.use(express.static('public'));
 app.use('/uploads', express.static('uploads'));
 app.use('/sounds', express.static('public/sounds'));
 
+// Global incoming-message sound helper, injected into every server-rendered page.
+// Plays the existing /sounds/message-notification.wav, unlocks on first user gesture
+// (browsers block autoplay), and honours the user's soundEnabled notification preference.
+const globalSoundScript = `
+<script>
+(function () {
+  if (window.fymSoundInit) return;
+  window.fymSoundInit = true;
+  window.fymSoundEnabled = true;
+  var audio = new Audio('/sounds/message-notification.wav');
+  audio.preload = 'auto';
+  var unlocked = false;
+  function unlock() {
+    if (unlocked) return;
+    unlocked = true;
+    var v = audio.volume;
+    audio.volume = 0;
+    var p = audio.play();
+    if (p && p.then) { p.then(function () { audio.pause(); audio.currentTime = 0; audio.volume = v; }).catch(function () { audio.volume = v; }); }
+    document.removeEventListener('pointerdown', unlock);
+    document.removeEventListener('keydown', unlock);
+    document.removeEventListener('touchstart', unlock);
+  }
+  document.addEventListener('pointerdown', unlock);
+  document.addEventListener('keydown', unlock);
+  document.addEventListener('touchstart', unlock);
+  window.fymPlayMessageSound = function () {
+    if (!window.fymSoundEnabled) return;
+    try { audio.currentTime = 0; var pr = audio.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
+  };
+  fetch('/api/notifications/preferences')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) { if (d && typeof d.soundEnabled === 'boolean') window.fymSoundEnabled = d.soundEnabled; })
+    .catch(function () {});
+})();
+</script>`;
+
 app.use((req, res, next) => {
     const originalSend = res.send.bind(res);
     res.send = function(body) {
@@ -311,6 +348,9 @@ app.use((req, res, next) => {
             }
             if (!html.includes('link rel="manifest"')) {
                 html = html.replace('</head>', '    <link rel="manifest" href="/manifest.json">\n    <link rel="apple-touch-icon" href="/icon-192.png">\n</head>');
+            }
+            if (!html.includes('fymPlayMessageSound')) {
+                html = html.replace('</body>', globalSoundScript + '\n</body>');
             }
             if (!html.includes('serviceWorker.register')) {
                 html = html.replace('</body>', '\n<script>\n  if (\'serviceWorker\' in navigator) {\n    window.addEventListener(\'load\', () => {\n      navigator.serviceWorker.register(\'/sw.js\').catch(err => console.log(\'PWA registration failed:\', err));\n    });\n  }\n</script>\n</body>');
@@ -821,9 +861,17 @@ const globalStyles = `
         letter-spacing: 0.005em;
         min-height: 100vh;
         -webkit-font-smoothing: antialiased;
+        overflow-x: hidden;
+        overflow-wrap: break-word;
+        word-wrap: break-word;
     }
 
-    h1, h2, h3, h4, h5 { line-height: 1.2; letter-spacing: -0.02em; color: var(--md-on-surface); }
+    h1, h2, h3, h4, h5 { line-height: 1.2; letter-spacing: -0.02em; color: var(--md-on-surface); overflow-wrap: break-word; word-break: break-word; }
+    /* Long unbreakable strings (urls, emails, codes) must never force horizontal scroll */
+    p, li, td, th, span, a, label, button, input, select, textarea, .card, .btn { overflow-wrap: anywhere; }
+    img, video, iframe, svg, table { max-width: 100%; }
+    pre, code { white-space: pre-wrap; overflow-wrap: anywhere; }
+    table { display: block; width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
     h1 { font-size: clamp(28px, 4.5vw, 44px); font-weight: 800; }
     h2 { font-size: clamp(22px, 3vw, 28px); font-weight: 750; }
     h3 { font-size: 20px; font-weight: 700; }
@@ -2747,13 +2795,18 @@ app.get('/dashboard', requireAuth, (req, res) => {
     ${getFooter()}
     ${renderBottomNav(user, 'messages')}
     <script>
+        let lastUnreadTotal = null;
         function updateMessageBadge() {
             fetch('/api/messages/unread-count-total')
                 .then(res => res.ok ? res.json() : { count: 0 })
                 .then(data => {
+                    const count = data.count || 0;
+                    if (lastUnreadTotal !== null && count > lastUnreadTotal && window.fymPlayMessageSound) {
+                        window.fymPlayMessageSound();
+                    }
+                    lastUnreadTotal = count;
                     const badges = document.querySelectorAll('.message-badge');
                     badges.forEach(badge => {
-                        const count = data.count || 0;
                         badge.textContent = count > 99 ? '99+' : count;
                         badge.style.display = count > 0 ? 'flex' : 'none';
                     });
@@ -4374,6 +4427,7 @@ app.get('/chat/:userId', requireAuth, (req, res) => {
                 .then(data => {
                     if (!data || !data.hasNewMessages) return;
 
+                    if (data.messages.length && window.fymPlayMessageSound) window.fymPlayMessageSound();
                     data.messages.forEach(appendIncomingMessage);
                     lastMessageTime = data.messages.reduce((latest, message) => {
                         return new Date(message.time) > new Date(latest) ? message.time : latest;
