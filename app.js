@@ -4316,10 +4316,8 @@ app.get('/chat/:userId', requireAuth, (req, res) => {
         </div>
     </div>
 
-    <script src="/socket.io/socket.io.js"></script>
     <script>
-        const chatSocket = io();
-        chatSocket.emit('authenticate', ${currentUser.id});
+        let lastMessageTime = ${JSON.stringify(chatMessages.length ? new Date(Math.max(...chatMessages.map(message => new Date(message.time).getTime()))).toISOString() : null)};
 
         function appendIncomingMessage(message) {
             if (!message || message.to !== ${currentUser.id} || message.from !== ${chatPartner.id}) return;
@@ -4369,7 +4367,22 @@ app.get('/chat/:userId', requireAuth, (req, res) => {
             bubble.scrollIntoView({ behavior: 'smooth', block: 'end' });
         }
 
-        chatSocket.on('new_message', appendIncomingMessage);
+        function checkForNewMessages() {
+            const since = lastMessageTime ? '&since=' + encodeURIComponent(lastMessageTime) : '';
+            fetch('/api/messages/check-new?partnerId=${chatPartner.id}' + since)
+                .then(response => response.ok ? response.json() : null)
+                .then(data => {
+                    if (!data || !data.hasNewMessages) return;
+
+                    data.messages.forEach(appendIncomingMessage);
+                    lastMessageTime = data.messages.reduce((latest, message) => {
+                        return new Date(message.time) > new Date(latest) ? message.time : latest;
+                    }, lastMessageTime);
+                })
+                .catch(() => {});
+        }
+
+        setInterval(checkForNewMessages, 5000);
 
         // Chat Album Modal Functions
         function openChatAlbum() {
@@ -6381,6 +6394,42 @@ app.get('/api/messages/unread-count', requireAuth, (req, res) => {
 app.get('/api/messages/unread-count-total', requireAuth, (req, res) => {
     const count = messages.filter(m => m.to === req.session.userId && !m.read).length;
     res.json({ count });
+});
+
+// Poll for messages received in an open conversation.
+app.get('/api/messages/check-new', requireAuth, (req, res) => {
+    const userId = req.session.userId;
+    const partnerId = parseInt(req.query.partnerId, 10);
+    const sinceTime = req.query.since ? new Date(req.query.since).getTime() : 0;
+
+    if (!Number.isInteger(partnerId) || Number.isNaN(sinceTime)) {
+        return res.status(400).json({ hasNewMessages: false, messages: [] });
+    }
+
+    const newMessages = messages.filter(message =>
+        message.to === userId &&
+        message.from === partnerId &&
+        new Date(message.time).getTime() > sinceTime
+    );
+
+    newMessages.forEach(message => {
+        message.read = true;
+    });
+
+    res.json({
+        hasNewMessages: newMessages.length > 0,
+        messages: newMessages.map(message => ({
+            id: message.id || `${message.from}-${new Date(message.time).getTime()}-${message.type}`,
+            from: message.from,
+            to: message.to,
+            text: message.text,
+            type: message.type,
+            photoFile: message.photoFile,
+            time: message.time,
+            censored: message.censored,
+            cost: message.cost
+        }))
+    });
 });
 
 // Get online status of a user
