@@ -4316,7 +4316,61 @@ app.get('/chat/:userId', requireAuth, (req, res) => {
         </div>
     </div>
 
+    <script src="/socket.io/socket.io.js"></script>
     <script>
+        const chatSocket = io();
+        chatSocket.emit('authenticate', ${currentUser.id});
+
+        function appendIncomingMessage(message) {
+            if (!message || message.to !== ${currentUser.id} || message.from !== ${chatPartner.id}) return;
+
+            const chatInner = document.querySelector('#chatContainer .chat-inner');
+            if (!chatInner) return;
+
+            const emptyState = chatInner.querySelector('.empty-state');
+            if (emptyState) emptyState.remove();
+
+            const messageKey = String(message.id || (message.from + '-' + message.time + '-' + message.type));
+            const alreadyShown = Array.from(chatInner.querySelectorAll('[data-message-key]'))
+                .some(element => element.dataset.messageKey === messageKey);
+            if (alreadyShown) return;
+
+            const bubble = document.createElement('div');
+            bubble.className = 'message-bubble received';
+            bubble.dataset.messageKey = messageKey;
+
+            if (message.type === 'photo') {
+                const image = document.createElement('img');
+                image.className = 'msg-photo';
+                image.src = '/uploads/' + encodeURIComponent(message.photoFile || '');
+                image.alt = 'Shared photo';
+                image.onclick = () => showLightbox(message.photoFile);
+                image.onerror = () => msgPhotoFallback(image);
+                bubble.appendChild(image);
+            } else {
+                if (message.censored) {
+                    const warning = document.createElement('div');
+                    warning.className = 'msg-censored';
+                    warning.textContent = 'Contact information was removed';
+                    bubble.appendChild(warning);
+                }
+
+                const text = document.createElement('p');
+                text.className = 'msg-text';
+                text.textContent = message.text || '';
+                bubble.appendChild(text);
+            }
+
+            const meta = document.createElement('div');
+            meta.className = 'msg-meta';
+            meta.textContent = new Date(message.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            bubble.appendChild(meta);
+            chatInner.appendChild(bubble);
+            bubble.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        }
+
+        chatSocket.on('new_message', appendIncomingMessage);
+
         // Chat Album Modal Functions
         function openChatAlbum() {
             const modal = document.getElementById('chatAlbumModal');
@@ -4463,6 +4517,9 @@ app.post('/chat/:userId/send', requireAuth, (req, res) => {
     
     // Store sound info with the message for real-time delivery
     message.notificationSound = soundResult;
+
+    // Deliver the saved message to an open chat immediately.
+    sendRealtimeMessage(message, toUserId);
     
     // Log censorship if needed
     if (censorshipResult.hasContact) {
@@ -4535,6 +4592,7 @@ app.post('/chat/:userId/send-photo', requireAuth, upload.single('photo'), (req, 
     messages.push(message);
     
     createNotification(toUserId, 'message', `${currentUser.name} sent you a photo`, { fromUserId: currentUser.id });
+    sendRealtimeMessage(message, toUserId);
     
     res.redirect(`/chat/${toUserId}`);
 });
@@ -4576,6 +4634,7 @@ app.post('/chat/:userId/send-album-photo', requireAuth, (req, res) => {
 
     messages.push(message);
     createNotification(toUserId, 'message', `${currentUser.name} sent you a photo`, { fromUserId: currentUser.id });
+    sendRealtimeMessage(message, toUserId);
 
     return res.json({ success: true });
 });
