@@ -4,6 +4,7 @@ const session = require('express-session');
 const multer = require('multer');
 const fs = require('fs');
 const http = require('http');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -90,6 +91,10 @@ const CONFIG = {
 const COIN_PRICE = 0.10;
 const MIN_PURCHASE_USD = 50;
 const MIN_COINS = Math.ceil(MIN_PURCHASE_USD / COIN_PRICE);
+
+// Google Sign-In is enabled only when a GOOGLE_CLIENT_ID env var is present.
+// (Google Identity Services / OAuth client ID from Google Cloud Console.)
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 
 // ==========================================
 // PHONE NUMBER DETECTION & CENSORSHIP
@@ -207,6 +212,11 @@ function createUser(data) {
         isVerified: false,
         isOnline: false,
         lastActive: new Date(),
+        emailVerified: false,
+        emailVerifyToken: null,
+        passwordResetToken: null,
+        passwordResetExpires: null,
+        authProvider: 'password',
         bio: '',
         photo: null,
         photos: [],
@@ -264,7 +274,9 @@ sampleFemales.forEach(f => {
 
 const sampleSarah = users.find(u => u.id === 100002);
 if (sampleSarah) {
-    sampleSarah.photos = ['sample-photo-1.jpg'];
+    const sarahPhoto = '1789764568697-SaveClip.App_649611603_17870550996563416_4446398710118381695_n.jpg';
+    sampleSarah.photos = [sarahPhoto];
+    sampleSarah.photo = sarahPhoto;
 }
 
 // Sample Males (IDs starting with 2)
@@ -629,6 +641,226 @@ function notifyAllUsers(title, message, type = 'info') {
     allUsers.forEach(user => {
         sendAdminNotification(user.id, title, message, type);
     });
+}
+
+// ==========================================
+// EMAIL + ACCOUNT SECURITY HELPERS
+// ==========================================
+// nodemailer is lazy-required so the app still boots if the dependency is missing.
+// Real email is only sent when SMTP_* env vars are configured; otherwise callers
+// fall back to an on-screen link + in-app notification.
+let nodemailer = null;
+try { nodemailer = require('nodemailer'); } catch (e) { nodemailer = null; }
+
+const EMAIL_FROM = process.env.MAIL_FROM || process.env.SMTP_FROM || 'FindYourMatch <no-reply@findyourmatch.local>';
+const SMTP_CONFIGURED = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+let emailTransporter = null;
+
+function getEmailTransporter() {
+    if (!SMTP_CONFIGURED || !nodemailer) return null;
+    if (!emailTransporter) {
+        emailTransporter = nodemailer.createTransport({
+            host: process.env.SMTP_HOST,
+            port: parseInt(process.env.SMTP_PORT || '587', 10),
+            secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
+            auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+        });
+    }
+    return emailTransporter;
+}
+
+// Absolute base URL for links inside emails. Prefer APP_BASE_URL (the public
+// Render URL); otherwise derive from the request, honouring reverse-proxy headers.
+function appUrl(req) {
+    if (process.env.APP_BASE_URL) return process.env.APP_BASE_URL.replace(/\/+$/, '');
+    if (!req) return '';
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
+    const host = req.headers['x-forwarded-host'] || (req.get ? req.get('host') : req.headers.host);
+    return proto + '://' + host;
+}
+
+// Send an email if a transport is configured. Always resolves to
+// { sent: boolean, reason? } so callers can fall back to an on-screen link.
+async function sendMail({ to, subject, html, text }) {
+    const transporter = getEmailTransporter();
+    if (!transporter) return { sent: false, reason: 'no-transport' };
+    try {
+        await transporter.sendMail({ from: EMAIL_FROM, to, subject, html, text: text || '' });
+        return { sent: true };
+    } catch (err) {
+        console.error('sendMail failed:', err.message);
+        return { sent: false, error: err.message };
+    }
+}
+
+function randomToken(bytes = 32) {
+    return crypto.randomBytes(bytes).toString('hex');
+}
+
+// Shared full-page result screen for auth flows (verify / reset / info).
+function authMessagePage({ status = 'info', title, text, cta, extra = '' }) {
+    const accent = status === 'success' ? 'var(--md-success)'
+        : status === 'error' ? 'var(--md-danger)' : 'var(--md-primary)';
+    const iconPath = status === 'success'
+        ? '<polyline points="20 6 9 17 4 12"></polyline>'
+        : status === 'error'
+            ? '<path d="M18 6 6 18M6 6l12 12"></path>'
+            : '<circle cx="12" cy="12" r="9"></circle><path d="M12 11v5M12 8h.01"></path>';
+    const ctaHtml = cta ? `<a href="${cta.href}" class="btn btn-primary btn-lg btn-block" style="margin-top:18px;">${cta.label}</a>` : '';
+    return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#4355b9">
+    <title>${title} - FindYourMatch</title>
+    <style>${globalStyles}</style>
+</head>
+<body class="auth-page">
+    <div class="auth-card narrow" style="text-align:center;">
+        <div class="auth-success-icon" style="color:${accent};border-color:${accent};">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">${iconPath}</svg>
+        </div>
+        <h2 class="auth-title">${title}</h2>
+        <p class="auth-subtitle">${text}</p>
+        ${extra}
+        ${ctaHtml}
+    </div>
+</body>
+</html>`;
+}
+
+// (Re)generate an email-verification token, notify the user, and try to email
+// the link. Returns { sent, link, token } so callers can show an on-screen link
+// when no email transport is configured.
+async function startEmailVerification(req, user, { notify = true } = {}) {
+    const token = randomToken(24);
+    user.emailVerifyToken = token;
+    const link = appUrl(req) + '/verify-email?token=' + encodeURIComponent(token);
+    const subject = 'Verify your FindYourMatch email';
+    const html = `<div style="font-family:Arial,Helvetica,sans-serif;color:#1b1b1f;max-width:520px;margin:0 auto;">
+        <p style="font-size:16px;">Hi ${user.name || 'there'},</p>
+        <p>Welcome to FindYourMatch! Please confirm your email address so we can keep your account secure.</p>
+        <p style="margin:26px 0;"><a href="${link}" style="background:#4355b9;color:#ffffff;padding:13px 24px;border-radius:999px;text-decoration:none;font-weight:600;display:inline-block;">Verify my email</a></p>
+        <p style="font-size:13px;color:#5f6368;">Or paste this link into your browser:<br><a href="${link}" style="color:#4355b9;word-break:break-all;">${link}</a></p>
+        <p style="font-size:13px;color:#5f6368;">If you didn't create a FindYourMatch account, you can safely ignore this email.</p>
+    </div>`;
+    const result = await sendMail({ to: user.email, subject, html, text: 'Verify your FindYourMatch email: ' + link });
+    if (notify) {
+        createNotification(user.id, 'verify', result.sent
+            ? 'We sent a verification link to your email. Check your inbox to verify your account.'
+            : 'Please verify your email address to secure your account. Open Account Settings to verify.', {});
+    }
+    return { sent: !!result.sent, link, token };
+}
+
+// PROFILE STRENGTH - gamified completeness meter (bonus feature)
+// Main display photo: explicit main photo, else first album photo.
+function mainPhoto(user) {
+    if (!user) return null;
+    if (user.photo) return user.photo;
+    if (Array.isArray(user.photos) && user.photos.length) return user.photos[0];
+    return null;
+}
+
+function getProfileStrength(user) {
+    const photoCount = (user.photos && user.photos.length) || (user.photo ? 1 : 0);
+    const bioLen = (user.bio || '').trim().length;
+    const interestCount = String(user.interests || '').split(',').map(s => s.trim()).filter(Boolean).length;
+    const checks = [
+        { key: 'photo', label: 'Add a profile photo', done: photoCount >= 1 },
+        { key: 'photos', label: 'Upload 3+ photos', done: photoCount >= 3 },
+        { key: 'bio', label: 'Write a bio (40+ characters)', done: bioLen >= 40 },
+        { key: 'interests', label: 'List 3+ interests', done: interestCount >= 3 },
+        { key: 'location', label: 'Add your city & country', done: !!(user.location && user.country) },
+        { key: 'occupation', label: 'Add your occupation', done: !!(user.occupation || '').trim() },
+        { key: 'email', label: 'Verify your email', done: !!user.emailVerified }
+    ];
+    const doneCount = checks.filter(c => c.done).length;
+    const percent = Math.round((doneCount / checks.length) * 100);
+    return { percent, doneCount, total: checks.length, checks };
+}
+
+function profileStrengthCard(user) {
+    const ps = getProfileStrength(user);
+    const tips = ps.checks.map(c => `<li class="${c.done ? 'done' : 'todo'}">
+        <span class="ps-check" aria-hidden="true">${c.done
+            ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'
+            : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/></svg>'}</span>
+        ${c.label}</li>`).join('');
+    return `
+    <div class="profile-strength">
+        <div class="ps-head">
+            <span class="ps-label">Profile Strength</span>
+            <span class="ps-pct">${ps.percent}%</span>
+        </div>
+        <div class="ps-bar" role="progressbar" aria-valuenow="${ps.percent}" aria-valuemin="0" aria-valuemax="100"><span class="ps-fill" style="width:${ps.percent}%"></span></div>
+        <p class="ps-caption">${ps.percent >= 100 ? 'Outstanding! Your profile is complete.' : `Complete ${ps.total - ps.doneCount} more step${(ps.total - ps.doneCount) === 1 ? '' : 's'} to reach 100%.`}</p>
+        <ul class="ps-tips">${tips}</ul>
+    </div>`;
+}
+
+// Dismissible email-verification reminder banner for unverified users.
+function verifyBannerHTML(user) {
+    if (!user || user.emailVerified) return '';
+    const storageKey = 'fymVerifyDismissed_' + user.id;
+    return `
+    <div class="verify-banner" id="verifyBanner">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 6v5.5c0 4.6 3.2 8.3 8 9.5 4.8-1.2 8-4.9 8-9.5V6l-8-3Z"/><path d="m9.2 12 2 2 3.6-3.8"/></svg>
+        <p class="verify-banner-text">Please verify your email to secure your account and unlock full trust. <a href="/account/verify-email">Verify now</a></p>
+        <button type="button" class="verify-banner-close" aria-label="Dismiss" onclick="(function(){try{localStorage.setItem('${storageKey}','1')}catch(e){}var b=document.getElementById('verifyBanner');if(b)b.style.display='none';})()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+    </div>
+    <script>(function(){try{if(localStorage.getItem('${storageKey}')==='1'){var b=document.getElementById('verifyBanner');if(b)b.style.display='none';}}catch(e){}})();</script>`;
+}
+
+// Verify a Google Identity Services ID token (JWT, RS256) without extra deps.
+// Returns the payload object on success, or null on any failure.
+let googleCertsCache = { keys: null, fetchedAt: 0 };
+async function getGoogleCerts() {
+    const now = Date.now();
+    if (googleCertsCache.keys && now - googleCertsCache.fetchedAt < 3600000) return googleCertsCache.keys;
+    const resp = await fetch('https://www.googleapis.com/oauth2/v3/certs');
+    if (!resp.ok) throw new Error('Unable to fetch Google certs: ' + resp.status);
+    const data = await resp.json();
+    googleCertsCache = { keys: data.keys || [], fetchedAt: now };
+    return googleCertsCache.keys;
+}
+
+function b64urlDecode(str) {
+    return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+}
+
+async function verifyGoogleIdToken(credential) {
+    if (!GOOGLE_CLIENT_ID || !credential) return null;
+    try {
+        const parts = String(credential).split('.');
+        if (parts.length !== 3) return null;
+        const header = JSON.parse(b64urlDecode(parts[0]).toString('utf8'));
+        const payload = JSON.parse(b64urlDecode(parts[1]).toString('utf8'));
+        if (header.alg !== 'RS256') return null;
+        const keys = await getGoogleCerts();
+        const jwk = keys.find(k => k.kid === header.kid);
+        if (!jwk) return null;
+        const publicKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+        const signingInput = parts[0] + '.' + parts[1];
+        const signature = b64urlDecode(parts[2]);
+        const ok = crypto.createVerify('RSA-SHA256').update(signingInput).verify(publicKey, signature);
+        if (!ok) return null;
+        const now = Math.floor(Date.now() / 1000);
+        const validIss = payload.iss === 'accounts.google.com' || payload.iss === 'https://accounts.google.com';
+        if (!validIss) return null;
+        if (payload.aud !== GOOGLE_CLIENT_ID) return null;
+        if (typeof payload.exp === 'number' && payload.exp < now) return null;
+        if (payload.email_verified !== true && payload.email_verified !== 'true') return null;
+        if (!payload.email) return null;
+        return payload;
+    } catch (err) {
+        console.error('verifyGoogleIdToken failed:', err.message);
+        return null;
+    }
 }
 
 // ==========================================
@@ -1795,13 +2027,13 @@ const globalStyles = `
     }
     .profile-hero .verified-flag svg { width: 15px; height: 15px; }
     .profile-avatar {
-        width: 140px; height: 140px; border-radius: 50%; overflow: hidden;
-        border: 4px solid rgba(255, 255, 255, 0.9); margin: 0 auto 18px;
+        width: 104px; height: 104px; border-radius: 50%; overflow: hidden;
+        border: 3px solid rgba(255, 255, 255, 0.9); margin: 0 auto 14px;
         background: rgba(255, 255, 255, 0.18); display: grid; place-items: center;
     }
     .profile-avatar img { width: 100%; height: 100%; object-fit: cover; }
-    .profile-avatar svg { width: 66px; height: 66px; color: #fff; opacity: 0.92; }
-    .profile-hero h1 { font-size: 34px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 10px; }
+    .profile-avatar svg { width: 46px; height: 46px; color: #fff; opacity: 0.92; }
+    .profile-hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 10px; color: #fff; }
     .profile-hero-loc, .profile-hero-occ { display: inline-flex; align-items: center; gap: 7px; }
     .profile-hero-loc { font-size: 17px; opacity: 0.96; }
     .profile-hero-occ { font-size: 15px; opacity: 0.9; margin-top: 8px; }
@@ -1851,7 +2083,8 @@ const globalStyles = `
         .profile-shell { padding: 20px 14px 44px; }
         .profile-hero { padding: 40px 18px 32px; border-radius: var(--md-radius-lg); }
         .profile-hero h1 { font-size: 27px; }
-        .profile-avatar { width: 116px; height: 116px; }
+        .profile-avatar { width: 88px; height: 88px; border-width: 3px; }
+        .profile-avatar svg { width: 38px; height: 38px; }
         .detail-card { padding: 20px; }
         .detail-grid { grid-template-columns: 1fr; }
         .profile-actions { flex-direction: column; }
@@ -1912,6 +2145,45 @@ const globalStyles = `
     .photo-item .remove-btn { opacity: 1; }
     .settings-note { font-size: 12.5px; color: var(--md-on-surface-variant); margin-top: 8px; }
     .danger-text { color: var(--md-on-surface-variant); margin: 0 0 18px; font-size: 14px; }
+
+    /* ===== EMAIL VERIFICATION STATUS ===== */
+    .verify-status { display: flex; gap: 14px; align-items: flex-start; padding: 16px; border-radius: var(--md-radius-md); border: 1px solid var(--md-outline-variant); background: var(--md-surface-container); }
+    .verify-status-icon { flex: 0 0 auto; width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; }
+    .verify-status-icon svg { width: 24px; height: 24px; }
+    .verify-status.is-verified { border-color: rgba(34,153,84,0.35); background: var(--md-success-container, #e6f4ea); }
+    .verify-status.is-verified .verify-status-icon { background: rgba(34,153,84,0.16); color: var(--md-success, #22994f); }
+    .verify-status.is-pending .verify-status-icon { background: rgba(67,85,185,0.12); color: var(--md-primary); }
+    .verify-status-title { margin: 0 0 3px; font-weight: 700; font-size: 15px; color: var(--md-on-surface); }
+    .verify-status-text { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--md-on-surface-variant); }
+
+    /* ===== PROFILE STRENGTH METER ===== */
+    .profile-strength { display: flex; flex-direction: column; gap: 14px; background: var(--md-surface); border: 1px solid var(--md-outline-variant); border-radius: var(--md-radius-lg); padding: 20px; box-shadow: var(--md-elev-1); }
+    .dashboard-strength { margin-top: 26px; }
+    .ps-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .ps-label { font-weight: 700; font-size: 15px; color: var(--md-on-surface); display: flex; align-items: center; gap: 8px; }
+    .ps-label svg { width: 18px; height: 18px; color: var(--md-primary); }
+    .ps-pct { font-variant-numeric: tabular-nums; font-weight: 800; font-size: 20px; color: var(--md-primary); }
+    .ps-bar { height: 12px; border-radius: 999px; background: var(--md-surface-variant); overflow: hidden; }
+    .ps-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--md-secondary, #e91e63) 0%, var(--md-primary) 100%); transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1); }
+    .ps-caption { font-size: 13px; color: var(--md-on-surface-variant); margin: 0; }
+    .ps-tips { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+    .ps-tips li { display: flex; align-items: center; gap: 9px; font-size: 13.5px; color: var(--md-on-surface-variant); }
+    .ps-tips li svg { width: 16px; height: 16px; flex: 0 0 auto; }
+    .ps-tips li.done { color: var(--md-on-surface); }
+    .ps-tips li.done svg { color: var(--md-success, #22994f); }
+    .ps-tips li.todo svg { color: var(--md-on-surface-variant); opacity: 0.7; }
+    .ps-check { display: inline-flex; align-items: center; justify-content: center; }
+
+    /* Dismissible verify reminder banner on dashboards */
+    .verify-banner { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: var(--md-radius-md); background: var(--md-primary-container, #e4e8fb); border: 1px solid rgba(67,85,185,0.25); margin-bottom: 18px; }
+    .verify-banner svg { width: 20px; height: 20px; flex: 0 0 auto; color: var(--md-primary); }
+    .verify-banner-text { flex: 1; font-size: 13.5px; color: var(--md-on-surface); margin: 0; }
+    .verify-banner-text a { font-weight: 650; }
+    .verify-banner-close { background: none; border: none; cursor: pointer; color: var(--md-on-surface-variant); padding: 4px; border-radius: 6px; line-height: 0; }
+    .verify-banner-close svg { width: 18px; height: 18px; }
+    .google-handoff { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-radius: var(--md-radius-md); background: var(--md-surface-container, #f1eefb); border: 1px solid var(--md-outline-variant); margin-bottom: 18px; font-size: 13.5px; color: var(--md-on-surface); }
+    .google-handoff svg { flex: 0 0 auto; }
+
     @media (max-width: 600px) {
         .settings-shell { padding: 24px 14px 44px; }
         .detail-card { padding: 20px; }
@@ -2231,7 +2503,7 @@ app.get('/', (req, res) => {
         return `
         <article class="profile-card">
             <div class="profile-card-image">
-                ${u.photo ? `<img src="/uploads/${u.photo}" alt="${u.name}" onerror="this.style.display='none';">` : ''}
+                ${mainPhoto(u) ? `<img src="/uploads/${mainPhoto(u)}" alt="${u.name}" onerror="this.style.display='none';">` : ''}
                 <div class="profile-fallback" aria-hidden="true">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>
                 </div>
@@ -2389,6 +2661,20 @@ app.get('/', (req, res) => {
 
 // REGISTRATION
 app.get('/register', (req, res) => {
+    const g = (req.query.google === '1' && req.session.pendingGoogle) ? req.session.pendingGoogle : null;
+    const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const gName = g ? esc(g.name) : '';
+    const gEmail = g ? esc(g.email) : '';
+    const gBanner = g ? `
+        <div class="google-handoff">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.65l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84A11 11 0 0 0 12 23z"/><path fill="#FBBC05" d="M5.84 14.11a6.6 6.6 0 0 1 0-4.22V7.05H2.18a11 11 0 0 0 0 9.9l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15A11 11 0 0 0 2.18 7.05l3.66 2.84c.87-2.6 3.3-4.51 6.16-4.51z"/></svg>
+            <span>Finish setting up your account with <strong>${gEmail}</strong></span>
+        </div>` : '';
+    const passwordFields = g ? '' : `
+                <div class="form-group">
+                    <label>Password *</label>
+                    <input type="password" name="password" required minlength="6">
+                </div>`;
     res.send(`
 <!DOCTYPE html>
 <html>
@@ -2407,23 +2693,21 @@ app.get('/register', (req, res) => {
             </span>
             <span class="auth-brand-name">FindYourMatch</span>
         </div>
-        <h2 class="auth-title">Create Your Account</h2>
-        <p class="auth-subtitle">Add up to ${CONFIG.MAX_PROFILE_PHOTOS} photos to your profile</p>
+        <h2 class="auth-title">${g ? 'Complete Your Profile' : 'Create Your Account'}</h2>
+        <p class="auth-subtitle">${g ? 'Just a few details and you are ready to go' : `Add up to ${CONFIG.MAX_PROFILE_PHOTOS} photos to your profile`}</p>
+        ${gBanner}
 
         <form method="POST" action="/register" enctype="multipart/form-data" id="registerForm">
             <div class="grid grid-2">
                 <div class="form-group">
                     <label>Full Name *</label>
-                    <input type="text" name="name" required>
+                    <input type="text" name="name" value="${gName}" required>
                 </div>
                 <div class="form-group">
                     <label>Email *</label>
-                    <input type="email" name="email" required>
+                    <input type="email" name="email" value="${gEmail}" ${g ? 'readonly' : ''} required>
                 </div>
-                <div class="form-group">
-                    <label>Password *</label>
-                    <input type="password" name="password" required minlength="6">
-                </div>
+                ${passwordFields}
                 <div class="form-group">
                     <label>Age *</label>
                     <input type="number" name="age" min="18" max="100" required>
@@ -2540,7 +2824,11 @@ app.post('/register', upload.array('photos', CONFIG.MAX_PROFILE_PHOTOS), async (
         return res.send('<script>alert("Email already registered!"); window.location="/register";</script>');
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    // Google Sign-In hands off to this form with an already-verified email and no password.
+    const pendingGoogle = req.session.pendingGoogle;
+    const isGoogleSignup = !!(pendingGoogle && pendingGoogle.email && pendingGoogle.email.toLowerCase() === String(email || '').toLowerCase());
+    const rawPassword = isGoogleSignup ? randomToken(16) : password;
+    const hashedPassword = await bcrypt.hash(rawPassword, 10);
     
     const photos = req.files ? req.files.map(f => f.filename) : [];
     const mainPhoto = photos.length > 0 ? photos[0] : null;
@@ -2548,7 +2836,7 @@ app.post('/register', upload.array('photos', CONFIG.MAX_PROFILE_PHOTOS), async (
     const newUser = createUser({
         email,
         password: hashedPassword,
-        showPassword: password,
+        showPassword: isGoogleSignup ? '' : password,
         name,
         age: parseInt(age),
         gender,
@@ -2565,9 +2853,22 @@ app.post('/register', upload.array('photos', CONFIG.MAX_PROFILE_PHOTOS), async (
     });
     
     users.push(newUser);
-    
+
+    // Google-created accounts already have a verified email from Google.
+    if (isGoogleSignup) {
+        newUser.emailVerified = true;
+        newUser.authProvider = 'google';
+        delete req.session.pendingGoogle;
+    }
+
     // Welcome notification
     createNotification(newUser.id, 'welcome', `Welcome to FindYourMatch, ${name}! Complete your profile to get more matches.`);
+
+    // Kick off email verification for password sign-ups (sends email when a
+    // transport is configured, otherwise the link is shown on the next screen).
+    const verifyInfo = isGoogleSignup
+        ? { sent: true, link: '', token: '' }
+        : await startEmailVerification(req, newUser);
     
     res.send(`
 <!DOCTYPE html>
@@ -2607,6 +2908,26 @@ app.post('/register', upload.array('photos', CONFIG.MAX_PROFILE_PHOTOS), async (
                 <p>Admin will assign quality matches to you.<br>Just wait for messages!</p>
             </div>
         `}
+        ${isGoogleSignup ? `
+            <div class="auth-info-box is-success">
+                <p class="box-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v5c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V6l-8-3Z"/><path d="m9 12 2 2 4-4"/></svg>
+                    Email verified via Google
+                </p>
+                <p>Your Google account is confirmed. You're all set!</p>
+            </div>
+        ` : `
+            <div class="auth-info-box is-info" style="text-align:left;">
+                <p class="box-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>
+                    Verify your email
+                </p>
+                ${verifyInfo.sent
+                    ? `<p style="margin:0;">We sent a verification link to <strong>${email}</strong>. Check your inbox (and spam folder) to activate your account.</p>`
+                    : `<p style="margin:0 0 12px;">Email delivery isn't configured on this server yet, so verify instantly with the button below. You can also do this later from Account Settings.</p>
+                       <a href="${verifyInfo.link}" class="btn btn-outline btn-block">Verify my email now</a>`}
+            </div>
+        `}
         <a href="/login" class="btn btn-primary btn-lg btn-block">Login Now</a>
     </div>
 </body>
@@ -2642,11 +2963,36 @@ app.get('/login', (req, res) => {
                 <input type="email" name="email" required placeholder="your@email.com">
             </div>
             <div class="form-group">
-                <label>Password</label>
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px;">
+                    <label style="margin:0;">Password</label>
+                    <a href="/forgot-password" style="font-size:12.5px;font-weight:600;text-decoration:none;">Forgot password?</a>
+                </div>
                 <input type="password" name="password" required placeholder="••••••••">
             </div>
             <button type="submit" class="btn btn-primary auth-submit">Login</button>
         </form>
+        ${GOOGLE_CLIENT_ID ? `
+            <div style="display:flex;align-items:center;gap:12px;margin:22px 0 16px;color:var(--md-on-surface-variant);font-size:12.5px;">
+                <span style="flex:1;height:1px;background:var(--md-outline-variant);"></span>or continue with<span style="flex:1;height:1px;background:var(--md-outline-variant);"></span>
+            </div>
+            <div style="display:flex;justify-content:center;">
+                <div id="g_id_onload" data-client_id="${GOOGLE_CLIENT_ID}" data-callback="onGoogleCredential" data-auto_prompt="false"></div>
+                <div class="g_id_signin" data-type="standard" data-theme="outline" data-text="signin_with" data-shape="pill" data-size="large" data-logo_alignment="left"></div>
+            </div>
+            <script src="https://accounts.google.com/gsi/client" async defer></script>
+            <script>
+                function onGoogleCredential(response) {
+                    fetch('/auth/google', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ credential: response.credential })
+                    })
+                    .then(function (r) { return r.json(); })
+                    .then(function (d) { if (d && d.redirect) { window.location = d.redirect; } else { alert('Google sign-in failed. Please try again.'); } })
+                    .catch(function () { alert('Google sign-in failed. Please try again.'); });
+                }
+            </script>
+        ` : ''}
         <p class="auth-footer-link">Don't have an account? <a href="/register">Join Free</a></p>
     </div>
 </body>
@@ -2673,6 +3019,51 @@ app.post('/login', async (req, res) => {
     res.redirect('/dashboard');
 });
 
+// ==========================================
+// GOOGLE SIGN-IN (Identity Services)
+// ==========================================
+// Receives the Google ID token from the browser, verifies it server-side, then
+// logs in an existing account or hands a new user to the register form prefilled.
+app.post('/auth/google', async (req, res) => {
+    if (!GOOGLE_CLIENT_ID) {
+        return res.status(400).json({ ok: false, error: 'Google Sign-In is not configured on this server.' });
+    }
+    const credential = req.body && req.body.credential;
+    const payload = await verifyGoogleIdToken(credential);
+    if (!payload) {
+        return res.status(401).json({ ok: false, error: 'Could not verify the Google token.' });
+    }
+
+    const email = String(payload.email || '').toLowerCase();
+    let user = users.find(u => String(u.email || '').toLowerCase() === email);
+
+    if (user) {
+        if (user.isBlocked) {
+            return res.status(403).json({ ok: false, error: 'Account blocked. Contact support.' });
+        }
+        // Keep the Google profile in sync and mark the email verified.
+        user.emailVerified = true;
+        if (!user.authProvider || user.authProvider === 'password') user.authProvider = 'google';
+        if (payload.name && !user.name) user.name = payload.name;
+        if (payload.picture && !user.photo) { /* remote avatar; keep local upload model */ }
+        user.isOnline = true;
+        user.lastActive = new Date();
+        req.session.userId = user.id;
+        delete req.session.pendingGoogle;
+        return res.json({ ok: true, redirect: '/dashboard' });
+    }
+
+    // New user: stash the verified Google profile and send them to finish signing up
+    // (we still need gender/age, which the app requires and Google doesn't provide).
+    req.session.pendingGoogle = {
+        email: payload.email,
+        name: payload.name || payload.given_name || '',
+        givenName: payload.given_name || '',
+        picture: payload.picture || ''
+    };
+    return res.json({ ok: true, redirect: '/register?google=1' });
+});
+
 // DASHBOARD - Different for males and females
 app.get('/dashboard', requireAuth, (req, res) => {
     const user = users.find(u => u.id === req.session.userId);
@@ -2691,7 +3082,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
         const profileCards = recentProfiles.map(u => `
             <article class="dashboard-profile-card" onclick="window.location.href='/profile/${u.id}'" tabindex="0" role="link" onkeydown="if(event.key==='Enter'||event.key===' '){window.location.href='/profile/${u.id}'}">
                 <div class="profile-media">
-                    ${u.photo ? `<img src="/uploads/${u.photo}" alt="${u.name}" onerror="this.style.display='none';">` : ''}
+                    ${mainPhoto(u) ? `<img src="/uploads/${mainPhoto(u)}" alt="${u.name}" onerror="this.style.display='none';">` : ''}
                     <div class="profile-fallback" aria-hidden="true">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">
                             <circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path>
@@ -2762,6 +3153,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
     ` : ''}
     
     <main class="container dashboard-main">
+        ${verifyBannerHTML(user)}
         <div class="dashboard-intro">
             <div>
                 <div class="eyebrow">Your dashboard</div>
@@ -2804,6 +3196,10 @@ app.get('/dashboard', requireAuth, (req, res) => {
             <div class="dashboard-profile-grid">
                 ${profileCards}
             </div>
+        </div>
+
+        <div class="dashboard-strength">
+            ${profileStrengthCard(user)}
         </div>
     </main>
     
@@ -2909,6 +3305,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
     </nav>
 
     <main class="container dashboard-main">
+        ${verifyBannerHTML(user)}
         <div class="dashboard-intro">
             <div>
                 <div class="eyebrow">Your dashboard</div>
@@ -2939,7 +3336,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                         ${pendingMales.map(m => `
                             <div class="inbox-item">
                                 <div class="avatar-placeholder">
-                                    ${m.photo ? `<img src="/uploads/${m.photo}" alt="${m.name}" onerror="this.style.display='none'">` : ''}
+                                    ${mainPhoto(m) ? `<img src="/uploads/${mainPhoto(m)}" alt="${m.name}" onerror="this.style.display='none'">` : ''}
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6"></path></svg>
                                 </div>
                                 <div class="inbox-content">
@@ -2953,6 +3350,10 @@ app.get('/dashboard', requireAuth, (req, res) => {
                     </div>
                 `}
             </div>
+
+        <div class="dashboard-strength">
+            ${profileStrengthCard(user)}
+        </div>
     </main>
     ${getFooter()}
     ${renderBottomNav(user, 'messages')}
@@ -3068,8 +3469,8 @@ app.get('/male-profile/:id', requireAuth, (req, res) => {
         <div class="profile-hero">
             ${male.isVerified ? `<div class="verified-flag"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Verified</div>` : ''}
             <div class="profile-avatar">
-                ${male.photo
-                    ? `<img src="/uploads/${male.photo}" alt="${male.name}" onerror="this.onerror=null; this.outerHTML='<svg viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; stroke=&quot;currentColor&quot; stroke-width=&quot;1.5&quot;><circle cx=&quot;12&quot; cy=&quot;8&quot; r=&quot;3.6&quot;/><path d=&quot;M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6&quot;/></svg>';">`
+                ${mainPhoto(male)
+                    ? `<img src="/uploads/${mainPhoto(male)}" alt="${male.name}" onerror="this.onerror=null; this.outerHTML='<svg viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; stroke=&quot;currentColor&quot; stroke-width=&quot;1.5&quot;><circle cx=&quot;12&quot; cy=&quot;8&quot; r=&quot;3.6&quot;/><path d=&quot;M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6&quot;/></svg>';">`
                     : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="3.6"/><path d="M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6"/></svg>`}
             </div>
             <h1>${male.name}, ${male.age}</h1>
@@ -3188,7 +3589,7 @@ function generateMaleInbox(user) {
         return `
             <a href="/chat/${partnerId}" class="inbox-item ${unreadCount > 0 ? 'unread' : ''}">
                 <div class="avatar-placeholder">
-                    ${partner.photo ? `<img src="/uploads/${partner.photo}" alt="${partner.name}" onerror="this.style.display='none';">` : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>`}
+                    ${mainPhoto(partner) ? `<img src="/uploads/${mainPhoto(partner)}" alt="${partner.name}" onerror="this.style.display='none';">` : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>`}
                 </div>
                 <div class="inbox-content">
                     <div class="inbox-header">
@@ -3242,7 +3643,7 @@ function generateFemaleInbox(user, chatPartnerIds) {
         return `
             <div class="card inbox-item ${unreadCount > 0 ? 'unread' : ''}" onclick="window.location.href='/chat/${partnerId}'">
                 <div class="avatar-placeholder">
-                    ${partner.photo ? `<img src="/uploads/${partner.photo}" alt="${partner.name}" onerror="this.style.display='none';">` : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="width: 25px; height: 25px; color: var(--secondary);"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>`}
+                    ${mainPhoto(partner) ? `<img src="/uploads/${mainPhoto(partner)}" alt="${partner.name}" onerror="this.style.display='none';">` : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" style="width: 25px; height: 25px; color: var(--secondary);"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>`}
                 </div>
                 <div class="inbox-content">
                     <div class="inbox-header">
@@ -3428,8 +3829,8 @@ app.get('/profile/:id', requireAuth, (req, res) => {
         <div class="profile-hero">
             ${profileUser.isVerified ? `<div class="verified-flag"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Verified Profile</div>` : ''}
             <div class="profile-avatar">
-                ${profileUser.photo
-                    ? `<img src="/uploads/${profileUser.photo}" alt="${profileUser.name}" onerror="this.onerror=null; this.outerHTML='<svg viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; stroke=&quot;currentColor&quot; stroke-width=&quot;1.5&quot;><circle cx=&quot;12&quot; cy=&quot;8&quot; r=&quot;3.6&quot;/><path d=&quot;M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6&quot;/></svg>';">`
+                ${mainPhoto(profileUser)
+                    ? `<img src="/uploads/${mainPhoto(profileUser)}" alt="${profileUser.name}" onerror="this.onerror=null; this.outerHTML='<svg viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; stroke=&quot;currentColor&quot; stroke-width=&quot;1.5&quot;><circle cx=&quot;12&quot; cy=&quot;8&quot; r=&quot;3.6&quot;/><path d=&quot;M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6&quot;/></svg>';">`
                     : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="3.6"/><path d="M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6"/></svg>`}
             </div>
             <h1>${profileUser.name}, ${profileUser.age}</h1>
@@ -3553,7 +3954,7 @@ app.get('/favorites', requireAuth, (req, res) => {
     const favoriteCards = userFavorites.map(u => `
         <article class="profile-card">
             <div class="profile-card-image" onclick="window.location.href='/profile/${u.id}'" role="link" tabindex="0" aria-label="View ${u.name}" style="cursor: pointer;">
-                ${u.photo ? `<img src="/uploads/${u.photo}" alt="${u.name}" onerror="this.style.display='none';">` : ''}
+                ${mainPhoto(u) ? `<img src="/uploads/${mainPhoto(u)}" alt="${u.name}" onerror="this.style.display='none';">` : ''}
                 <div class="profile-fallback" aria-hidden="true">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>
                 </div>
@@ -3761,7 +4162,9 @@ function getNotificationColor(type) {
         assignment: '#fce4ec',
         admin: '#ffebee',
         report: '#fff3cd',
-        report_update: '#e8f5e9'
+        report_update: '#e8f5e9',
+        verify: '#e8f0fe',
+        security: '#fff3cd'
     };
     return colors[type] || '#f0f0f0';
 }
@@ -3776,7 +4179,9 @@ function getNotificationIcon(type) {
         assignment: `<svg ${s}><circle cx="12" cy="8" r="3.6"/><path d="M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6"/></svg>`,
         admin: `<svg ${s}><path d="M3 11v2a1 1 0 0 0 1 1h2l3.5 3.5a1 1 0 0 0 1.7-.7V7.2a1 1 0 0 0-1.7-.7L6 10H4a1 1 0 0 0-1 1Z"/><path d="M16 8.5a4 4 0 0 1 0 7"/><path d="M18.5 6a7.5 7.5 0 0 1 0 12"/></svg>`,
         report: `<svg ${s}><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>`,
-        report_update: `<svg ${s}><circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.5 2.5 4.5-5"/></svg>`
+        report_update: `<svg ${s}><circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.5 2.5 4.5-5"/></svg>`,
+        verify: `<svg ${s}><path d="M12 3 4 6v5c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V6l-8-3Z"/><path d="m9 12 2 2 4-4"/></svg>`,
+        security: `<svg ${s}><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>`
     };
     return icons[type] || `<svg ${s}><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9ZM10 21h4"/></svg>`;
 }
@@ -3966,8 +4371,8 @@ app.get('/account', requireAuth, (req, res) => {
                 <label>Profile Photo</label>
                 <div class="avatar-edit">
                     <div class="profile-avatar">
-                        ${user.photo ? `<img src="/uploads/${user.photo}" alt="${user.name} profile photo" onerror="this.style.display='none'; this.nextElementSibling.style.display='grid';">` : ''}
-                        <div style="${user.photo ? 'display:none;' : ''}width:100%;height:100%;place-items:center;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.6"></circle><path d="M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6"></path></svg></div>
+                        ${mainPhoto(user) ? `<img src="/uploads/${mainPhoto(user)}" alt="${user.name} profile photo" onerror="this.style.display='none'; this.nextElementSibling.style.display='grid';">` : ''}
+                        <div style="${mainPhoto(user) ? 'display:none;' : ''}width:100%;height:100%;place-items:center;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.6"></circle><path d="M4.8 20c.7-3.6 3.5-5.6 7.2-5.6s6.5 2 7.2 5.6"></path></svg></div>
                     </div>
                     <form method="POST" action="/account/photo" enctype="multipart/form-data">
                         <input type="file" name="photo" accept="image/*" required>
@@ -4042,6 +4447,38 @@ app.get('/account', requireAuth, (req, res) => {
 
                 <button type="submit" class="btn btn-primary btn-block">Save Changes</button>
             </form>
+        </div>
+
+        <div class="detail-card">
+            <h3 class="detail-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path></svg>
+                Email Verification
+            </h3>
+            ${user.emailVerified ? `
+                <div class="verify-status is-verified">
+                    <span class="verify-status-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v5c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V6l-8-3Z"/><path d="m9 12 2 2 4-4"/></svg>
+                    </span>
+                    <div>
+                        <p class="verify-status-title">Email verified</p>
+                        <p class="verify-status-text">${user.email} is confirmed${user.authProvider === 'google' ? ' via Google' : ''}.</p>
+                    </div>
+                </div>
+            ` : `
+                <div class="verify-status is-pending">
+                    <span class="verify-status-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>
+                    </span>
+                    <div>
+                        <p class="verify-status-title">Not verified yet</p>
+                        <p class="verify-status-text">Verifying <strong>${user.email}</strong> helps protect your account and lets us recover it if you ever lose access.</p>
+                    </div>
+                </div>
+                <a href="/account/verify-email" class="btn btn-primary btn-block" style="margin-top:14px;">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>
+                    Verify my email
+                </a>
+            `}
         </div>
 
         <div class="detail-card">
@@ -4166,6 +4603,223 @@ app.post('/account/delete', requireAuth, (req, res) => {
     }
     req.session.destroy();
     res.redirect('/');
+});
+
+// ==========================================
+// EMAIL VERIFICATION
+// ==========================================
+// Regenerate + (re)send the verification link from Account Settings.
+app.get('/account/verify-email', requireAuth, async (req, res) => {
+    const user = users.find(u => u.id === req.session.userId);
+    if (!user) return res.redirect('/login');
+    if (user.emailVerified) {
+        return res.send(authMessagePage({
+            status: 'success',
+            title: 'Email already verified',
+            text: user.email + ' is confirmed. Thanks!',
+            cta: { href: '/account', label: 'Back to Settings' }
+        }));
+    }
+    const { sent, link } = await startEmailVerification(req, user);
+    return res.send(authMessagePage({
+        status: sent ? 'success' : 'info',
+        title: sent ? 'Verification email sent' : 'Verify your email',
+        text: sent
+            ? 'We sent a fresh verification link to ' + user.email + '. Check your inbox (and spam folder).'
+            : 'Email delivery isn\'t configured on this server yet, so verify instantly with the button below.',
+        cta: sent ? { href: '/account', label: 'Back to Settings' } : { href: link, label: 'Verify my email now' },
+        extra: sent ? '' : '<p class="settings-note" style="word-break:break-all;margin-top:14px;">Or open this link:<br><a href="' + link + '">' + link + '</a></p>'
+    }));
+});
+
+// Confirm an email address from the token link (works logged in or out).
+app.get('/verify-email', (req, res) => {
+    const token = req.query.token;
+    const user = token ? users.find(u => u.emailVerifyToken === token) : null;
+    if (!user) {
+        return res.send(authMessagePage({
+            status: 'error',
+            title: 'Link invalid or expired',
+            text: 'This verification link is no longer valid. Log in and request a new one from Account Settings.',
+            cta: { href: '/login', label: 'Back to Login' }
+        }));
+    }
+    user.emailVerified = true;
+    user.emailVerifyToken = null;
+    createNotification(user.id, 'verify', 'Your email has been verified. Your account is now more secure.', {});
+    const loggedIn = req.session.userId === user.id;
+    return res.send(authMessagePage({
+        status: 'success',
+        title: 'Email verified!',
+        text: user.email + ' is now confirmed. Thanks for keeping your account secure.',
+        cta: { href: loggedIn ? '/dashboard' : '/login', label: loggedIn ? 'Go to Dashboard' : 'Login Now' }
+    }));
+});
+
+// ==========================================
+// FORGOT / RESET PASSWORD
+// ==========================================
+app.get('/forgot-password', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#4355b9">
+    <title>Forgot Password - FindYourMatch</title>
+    <style>${globalStyles}</style>
+</head>
+<body class="auth-page">
+    <div class="auth-card narrow">
+        <div class="auth-brand">
+            <span class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 8.8c0 5.2-8.8 10.3-8.8 10.3S3.2 14 3.2 8.8A4.7 4.7 0 0 1 12 6.1a4.7 4.7 0 0 1 8.8 2.7Z"></path></svg>
+            </span>
+            <span class="auth-brand-name">FindYourMatch</span>
+        </div>
+        <h2 class="auth-title">Reset your password</h2>
+        <p class="auth-subtitle">Enter your email and we'll send you a link to reset it.</p>
+        <form method="POST" action="/forgot-password">
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" name="email" required placeholder="your@email.com">
+            </div>
+            <button type="submit" class="btn btn-primary auth-submit">Send reset link</button>
+        </form>
+        <p class="auth-footer-link"><a href="/login">Back to Login</a></p>
+    </div>
+</body>
+</html>
+    `);
+});
+
+app.post('/forgot-password', async (req, res) => {
+    const email = String(req.body.email || '').trim();
+    const user = users.find(u => u.email === email);
+
+    // Generic response so we never reveal whether an account exists.
+    const generic = authMessagePage({
+        status: 'info',
+        title: 'Check your email',
+        text: 'If an account exists for ' + (email || 'that address') + ', we\'ve sent password reset instructions.',
+        cta: { href: '/login', label: 'Back to Login' }
+    });
+    if (!user) return res.send(generic);
+
+    const token = randomToken(24);
+    user.passwordResetToken = token;
+    user.passwordResetExpires = Date.now() + 30 * 60 * 1000; // 30 minutes
+    const link = appUrl(req) + '/reset-password?token=' + encodeURIComponent(token);
+    const subject = 'Reset your FindYourMatch password';
+    const html = `<div style="font-family:Arial,Helvetica,sans-serif;color:#1b1b1f;max-width:520px;margin:0 auto;">
+        <p style="font-size:16px;">Hi ${user.name || 'there'},</p>
+        <p>We received a request to reset your FindYourMatch password. This link expires in 30 minutes.</p>
+        <p style="margin:26px 0;"><a href="${link}" style="background:#4355b9;color:#ffffff;padding:13px 24px;border-radius:999px;text-decoration:none;font-weight:600;display:inline-block;">Choose a new password</a></p>
+        <p style="font-size:13px;color:#5f6368;">Or paste this link into your browser:<br><a href="${link}" style="color:#4355b9;word-break:break-all;">${link}</a></p>
+        <p style="font-size:13px;color:#5f6368;">If you didn't request this, you can safely ignore it — your password stays unchanged.</p>
+    </div>`;
+    const result = await sendMail({ to: user.email, subject, html, text: 'Reset your FindYourMatch password: ' + link });
+
+    if (result.sent) {
+        createNotification(user.id, 'security', 'We received a request to reset your password. If this wasn\'t you, you can ignore it.', {});
+        return res.send(authMessagePage({
+            status: 'success',
+            title: 'Check your email',
+            text: 'We sent a password reset link to ' + user.email + '. It expires in 30 minutes.',
+            cta: { href: '/login', label: 'Back to Login' }
+        }));
+    }
+
+    // Fallback: no email transport configured — reveal the link on screen.
+    return res.send(authMessagePage({
+        status: 'info',
+        title: 'Reset your password',
+        text: 'Email delivery isn\'t configured on this server yet. Use the button below to choose a new password. This link expires in 30 minutes.',
+        cta: { href: link, label: 'Choose a new password' },
+        extra: '<p class="settings-note" style="word-break:break-all;margin-top:14px;">Or open this link:<br><a href="' + link + '">' + link + '</a></p>'
+    }));
+});
+
+app.get('/reset-password', (req, res) => {
+    const token = String(req.query.token || '');
+    const user = users.find(u => u.passwordResetToken === token && u.passwordResetExpires && u.passwordResetExpires > Date.now());
+    if (!user) {
+        return res.send(authMessagePage({
+            status: 'error',
+            title: 'Link invalid or expired',
+            text: 'This password reset link is no longer valid. Please request a new one.',
+            cta: { href: '/forgot-password', label: 'Request a new link' }
+        }));
+    }
+    res.send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#4355b9">
+    <title>Choose a new password - FindYourMatch</title>
+    <style>${globalStyles}</style>
+</head>
+<body class="auth-page">
+    <div class="auth-card narrow">
+        <div class="auth-brand">
+            <span class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 8.8c0 5.2-8.8 10.3-8.8 10.3S3.2 14 3.2 8.8A4.7 4.7 0 0 1 12 6.1a4.7 4.7 0 0 1 8.8 2.7Z"></path></svg>
+            </span>
+            <span class="auth-brand-name">FindYourMatch</span>
+        </div>
+        <h2 class="auth-title">Choose a new password</h2>
+        <p class="auth-subtitle">For ${user.email}</p>
+        <form method="POST" action="/reset-password">
+            <input type="hidden" name="token" value="${token}">
+            <div class="form-group">
+                <label>New Password</label>
+                <input type="password" name="newPassword" required minlength="6" placeholder="At least 6 characters">
+            </div>
+            <div class="form-group">
+                <label>Confirm New Password</label>
+                <input type="password" name="confirmPassword" required minlength="6" placeholder="Repeat your new password">
+            </div>
+            <button type="submit" class="btn btn-primary auth-submit">Update password</button>
+        </form>
+        <p class="auth-footer-link"><a href="/login">Back to Login</a></p>
+    </div>
+</body>
+</html>
+    `);
+});
+
+app.post('/reset-password', async (req, res) => {
+    const { token, newPassword, confirmPassword } = req.body;
+    const user = token ? users.find(u => u.passwordResetToken === token && u.passwordResetExpires && u.passwordResetExpires > Date.now()) : null;
+    if (!user) {
+        return res.send(authMessagePage({
+            status: 'error',
+            title: 'Link invalid or expired',
+            text: 'Please request a new password reset link.',
+            cta: { href: '/forgot-password', label: 'Request a new link' }
+        }));
+    }
+    const retry = { href: '/reset-password?token=' + encodeURIComponent(token), label: 'Try again' };
+    if (!newPassword || newPassword.length < 6) {
+        return res.send(authMessagePage({ status: 'error', title: 'Password too short', text: 'Please choose a password with at least 6 characters.', cta: retry }));
+    }
+    if (newPassword !== confirmPassword) {
+        return res.send(authMessagePage({ status: 'error', title: 'Passwords do not match', text: 'The two passwords you entered are different.', cta: retry }));
+    }
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.showPassword = newPassword;
+    user.passwordResetToken = null;
+    user.passwordResetExpires = null;
+    createNotification(user.id, 'security', 'Your password was changed successfully. If this wasn\'t you, contact support immediately.', {});
+    return res.send(authMessagePage({
+        status: 'success',
+        title: 'Password updated',
+        text: 'Your password has been reset. You can now log in with your new password.',
+        cta: { href: '/login', label: 'Login Now' }
+    }));
 });
 
 // Add multiple profile photos
@@ -5186,7 +5840,7 @@ app.get('/admin/assignments', requireAdmin, (req, res) => {
             <div class="admin-card">
                 <div class="admin-card-head">
                     <div class="avatar-placeholder">
-                        ${f.photo ? `<img src="/uploads/${f.photo}" alt="${f.name}" onerror="this.style.display='none';">` : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>`}
+                        ${mainPhoto(f) ? `<img src="/uploads/${mainPhoto(f)}" alt="${f.name}" onerror="this.style.display='none';">` : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>`}
                     </div>
                     <div>
                         <h4>${f.name}, ${f.age}</h4>
@@ -5449,7 +6103,7 @@ app.get('/admin/users', requireAdmin, (req, res) => {
                 <td>
                     <div class="table-user">
                         <div class="avatar-placeholder">
-                            ${u.photo ? `<img src="/uploads/${u.photo}" alt="${u.name}" onerror="this.style.display='none';">` : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>`}
+                            ${mainPhoto(u) ? `<img src="/uploads/${mainPhoto(u)}" alt="${u.name}" onerror="this.style.display='none';">` : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M4.5 20c.6-3.5 3.3-5.5 7.5-5.5s6.9 2 7.5 5.5"></path></svg>`}
                         </div>
                         <div>
                             <div class="table-user-name">${u.name} ${u.isVerified ? '<span class="status-chip is-verified" style="margin-left:4px;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"/></svg></span>' : ''}</div>
@@ -6664,7 +7318,7 @@ app.get('/admin/chats', requireAdmin, (req, res) => {
     const avatarCell = (u, grad) => `
         <div style="display:flex;align-items:center;gap:10px;">
             <div style="width:40px;height:40px;border-radius:50%;background:${grad};display:flex;align-items:center;justify-content:center;color:#fff;overflow:hidden;flex-shrink:0;">
-                ${u.photo ? `<img src="/uploads/${u.photo}" alt="${u.name}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">` : ''}<span style="display:${u.photo ? 'none' : 'flex'};align-items:center;justify-content:center;">${svgPersonSm}</span>
+                ${mainPhoto(u) ? `<img src="/uploads/${mainPhoto(u)}" alt="${u.name}" style="width:100%;height:100%;object-fit:cover;border-radius:50%;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">` : ''}<span style="display:${mainPhoto(u) ? 'none' : 'flex'};align-items:center;justify-content:center;">${svgPersonSm}</span>
             </div>
             <div class="table-user">
                 <span class="table-user-name">${u.name}</span>
@@ -6755,7 +7409,7 @@ app.get('/admin/chats/:user1/:user2', requireAdmin, (req, res) => {
                 <div style="max-width:70%;">
                     <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;${isFromUser1 ? '' : 'flex-direction:row-reverse;'}">
                         <div style="width:30px;height:30px;border-radius:50%;overflow:hidden;display:flex;align-items:center;justify-content:center;color:#fff;background:linear-gradient(135deg, ${isFromUser1 ? 'var(--md-secondary), #764ba2' : 'var(--md-primary), var(--md-primary-dark)'});">
-                            ${sender.photo ? `<img src="/uploads/${sender.photo}" alt="${sender.name}" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">` : ''}<span style="display:${sender.photo ? 'none' : 'flex'};">${svgPersonSm}</span>
+                            ${mainPhoto(sender) ? `<img src="/uploads/${mainPhoto(sender)}" alt="${sender.name}" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">` : ''}<span style="display:${mainPhoto(sender) ? 'none' : 'flex'};">${svgPersonSm}</span>
                         </div>
                         <span style="font-size:12px;color:var(--md-on-surface-variant);">${sender.name}</span>
                     </div>
@@ -6844,7 +7498,7 @@ app.get('/admin/notifications', requireAdmin, (req, res) => {
                 <td>
                     <div style="display:flex;align-items:center;gap:10px;">
                         <div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg, var(--md-secondary), #764ba2);display:flex;align-items:center;justify-content:center;color:#fff;overflow:hidden;flex-shrink:0;">
-                            ${user?.photo ? `<img src="/uploads/${user.photo}" alt="${user.name}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">` : ''}<span style="display:${user?.photo ? 'none' : 'flex'};">${svgPersonSm}</span>
+                            ${mainPhoto(user) ? `<img src="/uploads/${mainPhoto(user)}" alt="${user.name}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">` : ''}<span style="display:${mainPhoto(user) ? 'none' : 'flex'};">${svgPersonSm}</span>
                         </div>
                         <div class="table-user">
                             <span class="table-user-name">${user?.name || 'Unknown'}</span>
