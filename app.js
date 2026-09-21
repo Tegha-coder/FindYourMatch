@@ -1537,7 +1537,7 @@ const globalStyles = `
         position: relative; height: 300px; overflow: hidden;
         background: linear-gradient(145deg, var(--md-primary-container), var(--md-secondary-container));
     }
-    .profile-card-image img { width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; transition: transform 400ms var(--md-ease); }
+    .profile-card-image img { position: relative; z-index: 1; width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; transition: transform 400ms var(--md-ease); }
     .profile-card:hover .profile-card-image img { transform: scale(1.05); }
     .profile-card-badge {
         position: absolute; top: 14px; right: 14px;
