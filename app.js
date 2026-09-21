@@ -1537,7 +1537,7 @@ const globalStyles = `
         position: relative; height: 300px; overflow: hidden;
         background: linear-gradient(145deg, var(--md-primary-container), var(--md-secondary-container));
     }
-    .profile-card-image img { width: 100%; height: 100%; object-fit: cover; transition: transform 400ms var(--md-ease); }
+    .profile-card-image img { width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; transition: transform 400ms var(--md-ease); }
     .profile-card:hover .profile-card-image img { transform: scale(1.05); }
     .profile-card-badge {
         position: absolute; top: 14px; right: 14px;
@@ -1558,7 +1558,7 @@ const globalStyles = `
     .profile-fallback { position: absolute; inset: 0; z-index: 0; display: grid; place-items: center; color: var(--md-primary); }
     .profile-fallback svg { width: 58px; height: 58px; opacity: 0.55; }
     .profile-media { position: relative; overflow: hidden; background: linear-gradient(145deg, var(--md-primary-container), var(--md-secondary-container)); }
-    .profile-media img { position: relative; z-index: 1; display: block; width: 100%; height: 100%; object-fit: cover; }
+    .profile-media img { position: relative; z-index: 1; display: block; width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }
     .profile-status {
         position: absolute; right: 10px; bottom: 10px; z-index: 2;
         display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px;
@@ -1789,7 +1789,7 @@ const globalStyles = `
     .photo-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 14px; margin: 22px 0; }
     .photo-item { position: relative; aspect-ratio: 1; border-radius: var(--md-radius-md); overflow: hidden; cursor: pointer; box-shadow: var(--md-elev-1); transition: transform var(--md-dur) var(--md-ease), box-shadow var(--md-dur) var(--md-ease); }
     .photo-item:hover { transform: scale(1.03); box-shadow: var(--md-elev-2); }
-    .photo-item img { width: 100%; height: 100%; object-fit: cover; }
+    .photo-item img { width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }
     .photo-item-fallback { width: 100%; height: 100%; display: grid; place-items: center; background: var(--md-surface-variant); color: var(--md-on-surface-variant); }
     .detail-card .photo-gallery { margin: 0; }
     .remove-btn {
@@ -1872,7 +1872,7 @@ const globalStyles = `
         .grid, .grid-2, .grid-3, .grid-4 { gap: 16px; }
         .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
         .dashboard-profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-        .dashboard-profile-card .profile-media { height: 160px; }
+        .dashboard-profile-card .profile-media { height: auto; aspect-ratio: 3 / 4; }
         .dashboard-stat-grid { grid-template-columns: 1fr; gap: 10px; }
         .dashboard-stat { min-height: 0; flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; }
         .dashboard-stat .daily-limit-bar { display: none; }
@@ -1881,7 +1881,7 @@ const globalStyles = `
         .dashboard-main { padding-top: 22px; }
 
         .hero { padding: 44px 18px 56px; }
-        .profile-card-image { height: 260px; }
+        .profile-card-image { height: auto; aspect-ratio: 3 / 4; }
 
         .btn { width: auto; }
         .section-heading { flex-direction: column; align-items: flex-start; gap: 12px; }
@@ -2031,7 +2031,7 @@ const globalStyles = `
         border: 3px solid rgba(255, 255, 255, 0.9); margin: 0 auto 14px;
         background: rgba(255, 255, 255, 0.18); display: grid; place-items: center;
     }
-    .profile-avatar img { width: 100%; height: 100%; object-fit: cover; }
+    .profile-avatar img { width: 100%; height: 100%; object-fit: cover; object-position: 50% 22%; }
     .profile-avatar svg { width: 46px; height: 46px; color: #fff; opacity: 0.92; }
     .profile-hero h1 { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 10px; color: #fff; }
     .profile-hero-loc, .profile-hero-occ { display: inline-flex; align-items: center; gap: 7px; }
@@ -2387,8 +2387,8 @@ const globalStyles = `
         .logo { font-size: 16px; }
         .brand-mark { width: 28px; height: 28px; border-radius: 9px; }
         .bottom-nav-item span { font-size: 10px; }
-        .profile-card-image { height: 220px; }
-        .dashboard-profile-card .profile-media { height: 150px; }
+        .profile-card-image { height: auto; aspect-ratio: 3 / 4; }
+        .dashboard-profile-card .profile-media { height: auto; aspect-ratio: 3 / 4; }
         .messages-shell, .coin-shop-shell, .upload-shell,
         .admin-shell, .notif-shell, .settings-shell { padding-left: 14px; padding-right: 14px; }
     }
