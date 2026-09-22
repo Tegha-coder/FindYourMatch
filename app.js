@@ -7686,6 +7686,11 @@ app.get('/messages', requireAuth, (req, res) => {
     `);
 });
 
+// Lightweight health endpoint for uptime pingers (keeps Render awake)
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+});
+
 // START SERVER
 if (require.main === module) {
     server.listen(PORT, () => {
