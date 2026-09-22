@@ -363,6 +363,21 @@ const globalSoundScript = `
         .catch(function () {});
     }, 10000);
   }
+  // Site-wide notification sound: poll the unread notification count and chime when
+  // it increases (new notification arrived while the page was open).
+  {
+    var lastNotifUnread = null;
+    setInterval(function () {
+      fetch('/api/notifications/unread-count')
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d || typeof d.count !== 'number') return;
+          if (lastNotifUnread !== null && d.count > lastNotifUnread) window.fymPlayMessageSound();
+          lastNotifUnread = d.count;
+        })
+        .catch(function () {});
+    }, 10000);
+  }
 })();
 </script>`;
 
@@ -5581,12 +5596,12 @@ app.get('/buy-coins/upload', requireAuth, (req, res) => {
                     <label>Gift Card Type *</label>
                     <select name="cardType" required>
                         <option value="">Select card type...</option>
-                        <option value="Apple Gift Card">Apple Gift Card ($50+)</option>
-                        <option value="Google Play">Google Play ($50+)</option>
-                        <option value="Amazon">Amazon ($50+)</option>
-                        <option value="Visa">Visa Gift Card ($50+)</option>
-                        <option value="Mastercard">Mastercard Gift Card ($50+)</option>
-                        <option value="Other">Other ($50+)</option>
+                        <option value="Apple Gift Card">Apple Gift Card ($${purchase.price})</option>
+                        <option value="Google Play">Google Play ($${purchase.price})</option>
+                        <option value="Amazon">Amazon ($${purchase.price})</option>
+                        <option value="Visa">Visa Gift Card ($${purchase.price})</option>
+                        <option value="Mastercard">Mastercard Gift Card ($${purchase.price})</option>
+                        <option value="Other">Other ($${purchase.price})</option>
                     </select>
                 </div>
 
@@ -7115,6 +7130,12 @@ app.get('/api/messages/unread-count', requireAuth, (req, res) => {
 // Get total unread message count for header badge refresh
 app.get('/api/messages/unread-count-total', requireAuth, (req, res) => {
     const count = messages.filter(m => m.to === req.session.userId && !m.read).length;
+    res.json({ count });
+});
+
+// Get unread notification count so the global sound helper can chime on new notifications
+app.get('/api/notifications/unread-count', requireAuth, (req, res) => {
+    const count = notifications.filter(n => n.userId === req.session.userId && !n.read).length;
     res.json({ count });
 });
 
