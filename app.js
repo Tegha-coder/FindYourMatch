@@ -363,20 +363,47 @@ const globalSoundScript = `
         .catch(function () {});
     }, 10000);
   }
-  // Site-wide notification sound: poll the unread notification count and chime when
-  // it increases (new notification arrived while the page was open).
+  // Live notification count badges (header bell + bottom-nav Alerts tab), mirroring
+  // how the message badge behaves. Creates the badge span if the server rendered none.
+  window.fymUpdateNotifBadges = function (count) {
+    var label = count > 99 ? '99+' : String(count);
+    var bells = document.querySelectorAll('a.notification-bell');
+    for (var i = 0; i < bells.length; i++) {
+      var b = bells[i].querySelector('.notification-count');
+      if (count > 0) {
+        if (!b) { b = document.createElement('span'); b.className = 'notification-count'; bells[i].appendChild(b); }
+        b.textContent = label;
+        b.style.display = 'flex';
+      } else if (b) { b.style.display = 'none'; }
+    }
+    var tabs = document.querySelectorAll('a.bottom-nav-item[href="/notifications"]');
+    for (var j = 0; j < tabs.length; j++) {
+      var t = tabs[j].querySelector('.bottom-nav-badge');
+      if (count > 0) {
+        if (!t) { t = document.createElement('span'); t.className = 'bottom-nav-badge'; tabs[j].appendChild(t); }
+        t.textContent = label;
+        t.style.display = 'flex';
+      } else if (t) { t.style.display = 'none'; }
+    }
+  };
+  // Site-wide notification sound + badge: poll the unread notification count, chime
+  // when it increases (new notification arrived while the page was open), and keep
+  // the bell / bottom-nav badges in sync.
   {
     var lastNotifUnread = null;
-    setInterval(function () {
+    var pollNotif = function () {
       fetch('/api/notifications/unread-count')
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (d) {
           if (!d || typeof d.count !== 'number') return;
           if (lastNotifUnread !== null && d.count > lastNotifUnread) window.fymPlayMessageSound();
           lastNotifUnread = d.count;
+          window.fymUpdateNotifBadges(d.count);
         })
         .catch(function () {});
-    }, 10000);
+    };
+    pollNotif();
+    setInterval(pollNotif, 10000);
   }
 })();
 </script>`;
@@ -6478,6 +6505,66 @@ app.get('/admin/transactions', requireAdmin, (req, res) => {
     const svgX = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
     const svgCard = '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg>';
 
+    // Payment history: every processed (approved / rejected) transaction, newest first,
+    // showing amount, date and the uploaded front/back card images.
+    const processed = transactions
+        .filter(t => t.status !== 'pending')
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    const historyRows = processed.map(t => `
+        <tr>
+            <td>
+                <div class="table-user">
+                    <span class="table-user-name">${t.userEmail}</span>
+                    <span class="table-user-sub">User ID: ${t.userId}</span>
+                </div>
+            </td>
+            <td>${t.cardType}</td>
+            <td>
+                <span class="table-user-name">$${t.price || MIN_PURCHASE_USD}</span>
+                <span class="table-user-sub">${(t.coinsRequested || 0).toLocaleString()} coins</span>
+            </td>
+            <td>
+                <a href="/uploads/${t.frontImage}" target="_blank" style="color:var(--md-primary);margin-right:10px;font-weight:600;">Front</a>
+                <a href="/uploads/${t.backImage}" target="_blank" style="color:var(--md-primary);font-weight:600;">Back</a>
+            </td>
+            <td>${new Date(t.createdAt).toLocaleDateString()}</td>
+            <td><span class="status-chip ${t.status === 'approved' ? 'is-approved' : 'is-rejected'}">${t.status === 'approved' ? 'Approved' : 'Rejected'}</span></td>
+        </tr>
+    `).join('');
+
+    const historySection = `
+        <div class="admin-head" style="margin-top:34px;">
+            <h2 class="admin-title">${svgCard} Payment History</h2>
+            <p class="admin-subtitle">${processed.length} processed payment${processed.length !== 1 ? 's' : ''} (approved or rejected).</p>
+        </div>
+        <div class="admin-card">
+            ${processed.length === 0 ? `
+                <div class="empty-state">
+                    <span class="auth-success-icon">${svgCheckCircle}</span>
+                    <h2>No Processed Payments Yet</h2>
+                    <p>Approved and rejected payments will appear here with the amount, date and card images.</p>
+                </div>
+            ` : `
+            <div class="table-wrap">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Card Type</th>
+                            <th>Amount</th>
+                            <th>Images</th>
+                            <th>Date</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>${historyRows}</tbody>
+                </table>
+            </div>
+            `}
+        </div>
+    `;
+
     if (pending.length === 0) {
         return res.send(`
 <!DOCTYPE html>
@@ -6499,6 +6586,7 @@ app.get('/admin/transactions', requireAdmin, (req, res) => {
                 <p>All caught up! Every gift card verification has been processed.</p>
             </div>
         </div>
+        ${historySection}
     </div>
 </body>
 </html>
@@ -6571,6 +6659,7 @@ app.get('/admin/transactions', requireAdmin, (req, res) => {
                 </table>
             </div>
         </div>
+        ${historySection}
     </div>
 </body>
 </html>
