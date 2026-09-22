@@ -6499,7 +6499,10 @@ app.get('/admin/transactions', requireAdmin, (req, res) => {
                 </div>
             </td>
             <td>${t.cardType}</td>
-            <td>$50+</td>
+            <td>
+                <span class="table-user-name">$${t.price || MIN_PURCHASE_USD}</span>
+                <span class="table-user-sub">${(t.coinsRequested || 0).toLocaleString()} coins</span>
+            </td>
             <td>
                 <a href="/uploads/${t.frontImage}" target="_blank" style="color:var(--md-primary);margin-right:10px;font-weight:600;">Front</a>
                 <a href="/uploads/${t.backImage}" target="_blank" style="color:var(--md-primary);font-weight:600;">Back</a>
